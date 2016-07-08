@@ -48,12 +48,25 @@ void usage_iotgrid(void)
 {
   printf("\niotgrid controller program\n");
   printf("Version %s\n", VERSION);
-  printf("\niotgrid [-d mask] [-h] get|post addr uri [payload]\n");
+  printf("\niotgrid [-d mask] [-h] get|post|obs addr uri [payload]\n");
   printf(" Example 1: iotgrid  get 2000::121f:e0ff:fe12:1d04 actuators/toggle\n");
   printf(" Example 2: iotgrid  get 2000::121f:e0ff:fe12:1d04 dc-dc/stateVector\n");
   printf(" Example 3: iotgrid  get 2000::121f:e0ff:fe12:1d04 dc-dc/controlParameters\n");
   printf(" Example 4: iotgrid  get 2000::121f:e0ff:fe12:1d04 .well-known/core\n");
   printf(" Example 5: iotgrid  post 2000::121f:e0ff:fe12:1d04 dc-dc/controlParameters Vref=12\n");
+  printf("\n");
+  printf("Current test: 3 URIs\n");
+  printf(" status: read-only:    ST=status VI=input voltage VO=output voltage II=input voltage IO=output voltage\n");
+  printf(" vdc:    configurable: VG=grid voltage SL=slope for VDC function PMX=max power allowed in VDC function\n");
+  printf(" hwcfg:  configurable: VMX=max voltage allowed IMX=max current allowed\n");
+  printf("\n");
+  printf("Example\n");
+  printf(" get  1: iotgrid get 2000::204:a3ff:fe00:48E7 dcdc/status\n");
+  printf(" get  2: iotgrid get 2000::204:a3ff:fe00:48E7 dcdc/vdc\n");
+  printf(" get  3: iotgrid get 2000::204:a3ff:fe00:48E7 dcdc/hwcfg\n");
+  printf(" post 1: iotgrid post 2000::204:a3ff:fe00:48E7 dcdc/vdc VG=12V\n");
+  printf(" post 2: iotgrid post 2000::204:a3ff:fe00:48E7 dcdc/hwcfg VMX=22V\n");
+  printf(" obs  1: iotgrid obs 2000::204:a3ff:fe00:48E7 dcdc/status\n");
   exit(-1);
 }
 
@@ -80,6 +93,7 @@ unsigned int debug = 0; /* default debug */
 #define M_RAW           (1<<0)
 #define M_GET           (1<<1)
 #define M_POST          (1<<2)
+#define M_OBS           (1<<3)
 
 unsigned int mode = 0; /* default mode */
 
@@ -240,7 +254,7 @@ int explicit_query_control(void)
   socklen_t clilen;
 
   struct coap_hdr *ch_rx, *ch_tx;
-  struct coap_opt_s *ch_os;
+  struct coap_opt_s *ch_os, *ch_obs;
   struct coap_opt_l *ch_ol;
 
   char buf[BUZSIZ];
@@ -269,6 +283,8 @@ int explicit_query_control(void)
     ch_tx->code = 1;
   if(mode & M_POST)
     ch_tx->code = 2;
+  if(mode & M_OBS)
+    ch_tx->code = 1;
 
   ch_tx->id = 0xBEEF;
 
@@ -289,7 +305,43 @@ int explicit_query_control(void)
     len = sizeof(struct coap_hdr) + strlen(uri) + 2;
   }
 #elif WITH_COAP == 13
+if (mode & M_OBS)
+{
   if(strlen(uri) <= 12) {
+printf("OBS uri <= 12\n");
+    // observe option
+    ch_obs = (struct coap_opt_s*) &buf[4];
+    ch_obs->delta = 6; // 11; /* Uri-Patch */
+    ch_obs->len = 0;
+
+    // Uri-path option
+    ch_os = (struct coap_opt_s*) &buf[5];
+    ch_os->delta = 5; // 11; /* Uri-Patch */
+    ch_os->len = strlen(uri);
+    strcpy(&buf[6], uri); /* Short opt */
+    len = sizeof(struct coap_hdr) + strlen(uri) + 1 + 1;
+  }
+  else if(strlen(uri) > 12) {
+printf("OBS uri > 12\n");
+    // observe option
+    ch_obs = (struct coap_opt_s*) &buf[4];
+    ch_obs->delta = 6; // 11; /* Uri-Patch */
+    ch_obs->len = 0;
+
+    // Uri-path option
+    ch_ol = (struct coap_opt_l*) &buf[5];
+    ch_ol->flag = 0xd;
+    ch_ol->delta = 5; // 11; /* Uri-Patch */
+    ch_ol->len = strlen(uri) - 0xd;
+    strcpy(&buf[7], uri); /* Long opt */
+    len = sizeof(struct coap_hdr) + strlen(uri) + 2 + 1;
+  }
+} 
+else
+{
+printf("else loop\n");
+  if(strlen(uri) <= 12) {
+printf("uri <= 12\n");
     ch_os = (struct coap_opt_s*) &buf[4];
     ch_os->delta = 11; // 11; /* Uri-Patch */
     ch_os->len = strlen(uri);
@@ -297,6 +349,7 @@ int explicit_query_control(void)
     len = sizeof(struct coap_hdr) + strlen(uri) + 1;
   }
   else if(strlen(uri) > 12) {
+printf("uri > 12\n");
     ch_ol = (struct coap_opt_l*) &buf[4];
     ch_ol->flag = 0xd;
     ch_ol->delta = 11; // 11; /* Uri-Patch */
@@ -304,6 +357,7 @@ int explicit_query_control(void)
     strcpy(&buf[6], uri); /* Long opt */
     len = sizeof(struct coap_hdr) + strlen(uri) + 2;
   }
+}
 #endif
 
   if(mode & M_POST) {
@@ -353,6 +407,190 @@ int explicit_query_control(void)
   return 0;
 }
 
+int observe_control(void)
+{
+  int i, sock, len;
+  socklen_t clilen;
+
+  struct coap_hdr *ch_rx, *ch_tx;
+  struct coap_opt_s *ch_os, *ch_obs;
+  struct coap_opt_l *ch_ol;
+
+  char buf[BUZSIZ];
+  char addrbuf[INET6_ADDRSTRLEN];
+
+  sock = socket(PF_INET6, SOCK_DGRAM, 0);
+
+  if (sock < 0) {
+    perror("creating socket");
+    exit(1);
+  }
+
+  memset(&client_addr, 0, sizeof(client_addr));
+  server_addr.sin6_family = AF_INET6;
+  server_addr.sin6_port = htons(PORT);
+
+  ch_tx = (struct coap_hdr*) &buf;
+  ch_tx->ver = 1;
+  ch_tx->type = 0;
+#if WITH_COAP == 7
+  ch_tx->oc = 1;
+#elif WITH_COAP == 13
+  ch_tx->tkl = 0;
+#endif
+  if(mode & M_GET)
+    ch_tx->code = 1;
+  if(mode & M_POST)
+    ch_tx->code = 2;
+  if(mode & M_OBS)
+    ch_tx->code = 1;
+
+  ch_tx->id = 0xBEEF;
+
+#if WITH_COAP == 7
+  if(strlen(uri) <= 14) {
+    ch_os = (struct coap_opt_s*) &buf[4];
+    ch_os->delta = 9; // 9; /* Uri-Patch */
+    ch_os->len = strlen(uri);
+    strcpy(&buf[5], uri); /* Short opt */
+    len = sizeof(struct coap_hdr) + strlen(uri) + 1;
+  }
+  else if(strlen(uri) > 14) {
+    ch_ol = (struct coap_opt_l*) &buf[4];
+    ch_ol->flag = 0xf;
+    ch_ol->delta = 9; // 9; /* Uri-Patch */
+    ch_ol->len = strlen(uri) - 0xf;
+    strcpy(&buf[6], uri); /* Long opt */
+    len = sizeof(struct coap_hdr) + strlen(uri) + 2;
+  }
+#elif WITH_COAP == 13
+if (mode & M_OBS)
+{
+  if(strlen(uri) <= 12) {
+printf("OBS uri <= 12\n");
+    // observe option
+    ch_obs = (struct coap_opt_s*) &buf[4];
+    ch_obs->delta = 6; // 11; /* Uri-Patch */
+    ch_obs->len = 0;
+
+    // Uri-path option
+    ch_os = (struct coap_opt_s*) &buf[5];
+    ch_os->delta = 5; // 11; /* Uri-Patch */
+    ch_os->len = strlen(uri);
+    strcpy(&buf[6], uri); /* Short opt */
+    len = sizeof(struct coap_hdr) + strlen(uri) + 1 + 1;
+  }
+  else if(strlen(uri) > 12) {
+printf("OBS uri > 12\n");
+    // observe option
+    ch_obs = (struct coap_opt_s*) &buf[4];
+    ch_obs->delta = 6; // 11; /* Uri-Patch */
+    ch_obs->len = 0;
+
+    // Uri-path option
+    ch_ol = (struct coap_opt_l*) &buf[5];
+    ch_ol->flag = 0xd;
+    ch_ol->delta = 5; // 11; /* Uri-Patch */
+    ch_ol->len = strlen(uri) - 0xd;
+    strcpy(&buf[7], uri); /* Long opt */
+    len = sizeof(struct coap_hdr) + strlen(uri) + 2 + 1;
+  }
+} 
+else
+{
+printf("else loop\n");
+  if(strlen(uri) <= 12) {
+printf("uri <= 12\n");
+    ch_os = (struct coap_opt_s*) &buf[4];
+    ch_os->delta = 11; // 11; /* Uri-Patch */
+    ch_os->len = strlen(uri);
+    strcpy(&buf[5], uri); /* Short opt */
+    len = sizeof(struct coap_hdr) + strlen(uri) + 1;
+  }
+  else if(strlen(uri) > 12) {
+printf("uri > 12\n");
+    ch_ol = (struct coap_opt_l*) &buf[4];
+    ch_ol->flag = 0xd;
+    ch_ol->delta = 11; // 11; /* Uri-Patch */
+    ch_ol->len = strlen(uri) - 0xd;
+    strcpy(&buf[6], uri); /* Long opt */
+    len = sizeof(struct coap_hdr) + strlen(uri) + 2;
+  }
+}
+#endif
+
+  if(mode & M_POST) {
+    strncat(&buf[len], payload, MAX_URI_LEN);
+    len += strlen(payload);
+  }
+
+  if(debug & D_COAP_PKT)
+    dump_pkt(ch_tx, len);
+
+  /* now send a datagrauri */
+  if (sendto(sock, ch_tx, len, 0,
+             (struct sockaddr *)&server_addr,
+	     sizeof(server_addr)) < 0) {
+      perror("sendto failed");
+      exit(4);
+  }
+
+while (1) {
+  clilen = sizeof(client_addr);
+
+  len = recvfrom(sock, buf, 1024, 0, (struct sockaddr *)&client_addr,
+		 &clilen);
+
+  if ( len < 0) {
+      perror("recvfrom failed");
+      return 1;
+  }
+
+  ch_rx = (struct coap_hdr*) &buf;
+
+  if(ch_tx->id != ch_rx->id) {
+    printf("Error: Wrong messaage ID\n");
+    return 1;
+  }
+
+  printf("Message from %s, len=%d\n", inet_ntop(AF_INET6, &client_addr.sin6_addr, 
+					 addrbuf, INET6_ADDRSTRLEN), len);
+
+  if(debug & D_COAP_PKT)
+    dump_pkt(ch_rx, len);
+
+  for(i = 5; i < len; i++)
+    printf("%c", (buf[i] & 0xFF));
+  printf("\n");
+
+  // check if this is a confirmable message
+  if ( ((buf[0] & 0x30)>>4) == 0 ) 
+  {
+  printf("CONFIRMABLE\n");
+  struct coap_hdr *ch_obs;
+  char ack[256]; 
+  ch_obs = (struct coap_hdr*) &ack;
+  ch_obs->ver = 1;
+  ch_obs->type = 2;
+  ch_obs->tkl = 0;
+  ch_obs->code = buf[1] & 0xFF;
+  ch_obs->id = ch_rx->id;
+  ack[4] = 0xFF;
+  //len = sizeof(struct coap_hdr) + 1;
+
+	if (sendto(sock, ch_obs, sizeof(struct coap_hdr) + 1, 0,
+                   (struct sockaddr *)&server_addr,
+	           sizeof(server_addr)) < 0) {
+            perror("sendto failed");
+            exit(4);
+        }
+  }
+} // end while(1)  
+
+  close(sock);
+  return 0;
+}
+
 int main(int ac, char *av[]) 
 {
   int i;
@@ -377,6 +615,11 @@ int main(int ac, char *av[])
 
       if (strcmp(av[i], "get") == 0) {
 	mode = M_GET;
+	break;
+      }
+
+      if (strcmp(av[i], "obs") == 0) {
+	mode = M_OBS;
 	break;
       }
     }
@@ -446,8 +689,14 @@ int main(int ac, char *av[])
   if(mode & M_RAW) 
     unsolicited_grid_reports();
 
-  if(mode & (M_GET | M_POST)) 
+  if(mode & (M_GET | M_POST))
     explicit_query_control();
+
+  if(mode & M_OBS)
+  { 
+    observe_control();
+  }
+
 
   exit(0);
 }
